@@ -69,11 +69,11 @@ class OpenAIChat(BaseLLMClient):
         temperature: float,
         tools: list[dict] | None = None,
     ) -> LLMResponse:
-        logger.info("--- LLM Request ---")
-        logger.info("Model: %s | Temperature: %s", model, temperature)
+        logger.debug("--- LLM Request ---")
+        logger.debug("Model: %s | Temperature: %s", model, temperature)
         for msg in messages:
             logger.debug("[%s]: %s", msg["role"], msg["content"])
-        logger.info("--------------------")
+        logger.debug("--------------------")
 
         kwargs: dict = {
             "model": model,
@@ -94,7 +94,7 @@ class OpenAIChat(BaseLLMClient):
             for tc in raw
         ]
 
-        logger.info("--- LLM Response ---")
+        logger.debug("--- LLM Response ---")
         logger.debug("%s", content)
-        logger.info("---------------------")
+        logger.debug("---------------------")
         return LLMResponse(content=content, tool_calls=tool_calls)
