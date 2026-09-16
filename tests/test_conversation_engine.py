@@ -4,10 +4,11 @@ import pytest
 
 from npc_conversation_engine.context_builder import ExampleContextBuilder
 from npc_conversation_engine.conversation_engine import ConversationEngine
-from npc_conversation_engine.llm_client import BaseLLMClient, LLMResponse
+from npc_conversation_engine.llm_client import BaseLLMClient, LLMResponse, ToolCall
 from npc_conversation_engine.models.character import Character
 from npc_conversation_engine.models.location import Location
 from npc_conversation_engine.prompt_manager import PromptManager
+from npc_conversation_engine.tools import BaseTool
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "prompts")
 
@@ -27,6 +28,33 @@ class FakeLLMClient(BaseLLMClient):
         response = self._responses[self._call_count % len(self._responses)]
         self._call_count += 1
         return LLMResponse(content=response)
+
+
+class GiveItemTool(BaseTool):
+    name = "give_item"
+    description = "Give an item to the player."
+
+    async def execute(self, arguments, conversation) -> str:
+        return "Item given."
+
+
+class ToolCallFakeLLMClient(BaseLLMClient):
+    """Fake client that returns pre-configured LLMResponse objects."""
+
+    def __init__(self, responses: list[LLMResponse]):
+        self._responses = responses
+        self._call_count = 0
+
+    async def chat(
+        self,
+        messages: list[dict],
+        model: str,
+        temperature: float,
+        tools: list[dict] | None = None,
+    ) -> LLMResponse:
+        response = self._responses[self._call_count % len(self._responses)]
+        self._call_count += 1
+        return response
 
 
 @pytest.fixture
@@ -254,7 +282,7 @@ class TestSpeakNext:
         engine.initialize_conversation(location, gandalf, frodo)
         await engine.speak_next()
         await engine.speak_next()
-        assert "LLMLineGenerator" in engine._generator_cache
+        assert ("LLMLineGenerator", ()) in engine._generator_cache
 
 
 class TestEngineDIForwarding:
@@ -340,3 +368,170 @@ class TestRunConversation:
     async def test_raises_without_conversation(self, engine):
         with pytest.raises(RuntimeError, match="No active conversation"):
             await engine.run_conversation()
+
+
+class TestToolResolution:
+    def test_forwards_tools_to_generator(
+        self, prompt_manager, context_builder, llm_client, location
+    ):
+        give_item = GiveItemTool()
+        engine = ConversationEngine(
+            prompt_manager=prompt_manager,
+            template_path="test_dialogue",
+            context_builder=context_builder,
+            llm_client=llm_client,
+            tools=[give_item],
+        )
+        character = Character(
+            name="Merchant",
+            gender="male",
+            age=40,
+            appearance="shopkeeper",
+            bio="a merchant",
+            type="npc",
+            line_generator="LLMLineGenerator",
+            tools=["give_item"],
+        )
+        other = Character(
+            name="Player",
+            gender="unknown",
+            age=20,
+            appearance="adventurer",
+            bio="a player",
+            type="player",
+        )
+        engine.initialize_conversation(location, character, other)
+        generator = engine._get_generator(character)
+        assert any(t.name == "give_item" for t in generator._tools)
+
+    def test_unknown_tool_raises(
+        self, prompt_manager, context_builder, llm_client, location
+    ):
+        engine = ConversationEngine(
+            prompt_manager=prompt_manager,
+            template_path="test_dialogue",
+            context_builder=context_builder,
+            llm_client=llm_client,
+        )
+        character = Character(
+            name="NPC",
+            gender="unknown",
+            age=30,
+            appearance="mysterious",
+            bio="mysterious",
+            type="npc",
+            line_generator="LLMLineGenerator",
+            tools=["missing"],
+        )
+        other = Character(
+            name="Player",
+            gender="unknown",
+            age=20,
+            appearance="adventurer",
+            bio="a player",
+            type="player",
+        )
+        engine.initialize_conversation(location, character, other)
+        with pytest.raises(ValueError, match="Unknown tool 'missing'"):
+            engine._get_generator(character)
+
+
+class TestUseTool:
+    @pytest.mark.asyncio
+    async def test_use_tool_executes(
+        self, prompt_manager, context_builder, llm_client, location, gandalf, frodo
+    ):
+        engine = ConversationEngine(
+            prompt_manager=prompt_manager,
+            template_path="test_dialogue",
+            context_builder=context_builder,
+            llm_client=llm_client,
+        )
+        engine.initialize_conversation(location, gandalf, frodo)
+        result = await engine.use_tool("end_conversation")
+        assert engine.conversation.ended is True
+        assert result == "Conversation ended."
+
+    @pytest.mark.asyncio
+    async def test_use_tool_unknown_raises(
+        self, prompt_manager, context_builder, llm_client, location, gandalf, frodo
+    ):
+        engine = ConversationEngine(
+            prompt_manager=prompt_manager,
+            template_path="test_dialogue",
+            context_builder=context_builder,
+            llm_client=llm_client,
+        )
+        engine.initialize_conversation(location, gandalf, frodo)
+        with pytest.raises(ValueError, match="Unknown tool 'nonexistent'"):
+            await engine.use_tool("nonexistent")
+
+    @pytest.mark.asyncio
+    async def test_use_tool_requires_conversation(
+        self, prompt_manager, context_builder, llm_client
+    ):
+        engine = ConversationEngine(
+            prompt_manager=prompt_manager,
+            template_path="test_dialogue",
+            context_builder=context_builder,
+            llm_client=llm_client,
+        )
+        with pytest.raises(RuntimeError, match="No active conversation"):
+            await engine.use_tool("end_conversation")
+
+
+class TestEarlyTermination:
+    @pytest.mark.asyncio
+    async def test_speak_next_returns_empty_when_ended(
+        self, engine, location, gandalf, frodo
+    ):
+        engine.initialize_conversation(location, gandalf, frodo)
+        engine.conversation.end()
+        line = await engine.speak_next()
+        assert line == ""
+        # History should remain empty — nothing was appended
+        assert len(engine.conversation.history) == 0
+
+    @pytest.mark.asyncio
+    async def test_run_conversation_stops_early(
+        self, prompt_manager, context_builder, location
+    ):
+        end_call = ToolCall(
+            id="call_1",
+            name="end_conversation",
+            arguments='{"farewell": "Farewell!"}',
+        )
+        fake_client = ToolCallFakeLLMClient(
+            responses=[
+                LLMResponse(content=None, tool_calls=[end_call]),
+            ]
+        )
+        engine = ConversationEngine(
+            prompt_manager=prompt_manager,
+            template_path="test_dialogue",
+            context_builder=context_builder,
+            llm_client=fake_client,
+        )
+        gandalf = Character(
+            name="Gandalf",
+            gender="male",
+            age=2000,
+            appearance="tall wizard",
+            bio="a wizard",
+            type="npc",
+            line_generator="LLMLineGenerator",
+            tools=["end_conversation"],
+        )
+        frodo = Character(
+            name="Frodo",
+            gender="male",
+            age=50,
+            appearance="short hobbit",
+            bio="a hobbit",
+            type="player",
+            line_generator="LLMLineGenerator",
+        )
+        engine.initialize_conversation(location, gandalf, frodo)
+        lines = await engine.run_conversation(rounds=5)
+        assert len(lines) < 5
+        assert engine.conversation.ended is True
