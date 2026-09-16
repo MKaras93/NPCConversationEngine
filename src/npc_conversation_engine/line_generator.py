@@ -64,8 +64,33 @@ class LLMLineGenerator(BaseLineGenerator):
         self._tools = tools or []
 
     async def generate(self, conversation: Conversation) -> str:
-        context = self._context_builder.get_context(conversation)
+        messages = self._build_messages(conversation)
+        tool_specs = [t.to_openai_spec() for t in self._tools]
 
+        for _ in range(MAX_TOOL_ITERATIONS):
+            response = await self._llm_client.chat(
+                messages, self._model, self._temperature, tools=tool_specs or None
+            )
+            if not response.tool_calls:
+                return response.content or ""
+
+            fed_back_calls, results = await self._process_tool_calls(
+                response.tool_calls, conversation
+            )
+
+            if not fed_back_calls:
+                return ""
+
+            if conversation.ended:
+                return ""
+
+            messages.append(self._assistant_tool_call_message(fed_back_calls))
+            self._append_tool_results(messages, fed_back_calls, results)
+
+        return ""
+
+    def _build_messages(self, conversation: Conversation) -> list[dict]:
+        context = self._context_builder.get_context(conversation)
         system_path = self._prompt_manager.resolve_prompt_path(
             f"{self._prompt_path}/system.j2"
         )
@@ -77,63 +102,60 @@ class LLMLineGenerator(BaseLineGenerator):
 
         messages: list[dict] = [{"role": "system", "content": system_msg}]
         messages.extend(history_messages)
+        return messages
 
-        tool_specs = [t.to_openai_spec() for t in self._tools]
+    async def _process_tool_calls(
+        self, tool_calls: list[ToolCall], conversation: Conversation
+    ) -> tuple[list[ToolCall], dict[str, str]]:
+        fed_back_calls: list[ToolCall] = []
+        results: dict[str, str] = {}
 
-        for _ in range(MAX_TOOL_ITERATIONS):
-            response = await self._llm_client.chat(
-                messages, self._model, self._temperature, tools=tool_specs or None
+        for tool_call in tool_calls:
+            result_or_error, should_feed_back = await self._execute_single_tool(
+                tool_call, conversation
             )
-            if not response.tool_calls:
-                return response.content or ""
+            if should_feed_back:
+                results[tool_call.id] = result_or_error
+                fed_back_calls.append(tool_call)
 
-            fed_back_calls: list[ToolCall] = []
-            results: dict[str, str] = {}
-            for tool_call in response.tool_calls:
-                tool = self._resolve_tool(tool_call.name)
-                if tool is None:
-                    results[tool_call.id] = f"Error: unknown tool '{tool_call.name}'."
-                    fed_back_calls.append(tool_call)
-                    continue
+        return fed_back_calls, results
 
-                try:
-                    arguments = tool_call.parsed_arguments
-                    if tool.arguments_model is not None:
-                        arguments = tool.arguments_model.model_validate(arguments)
-                except (json.JSONDecodeError, ValidationError) as exc:
-                    results[tool_call.id] = (
-                        f"Invalid arguments for tool '{tool_call.name}': {exc}"
-                    )
-                    fed_back_calls.append(tool_call)
-                    continue
+    async def _execute_single_tool(
+        self, tool_call: ToolCall, conversation: Conversation
+    ) -> tuple[str, bool]:
+        tool = self._resolve_tool(tool_call.name)
+        if tool is None:
+            return f"Error: unknown tool '{tool_call.name}'.", True
 
-                try:
-                    result = await tool.execute(arguments, conversation)
-                except Exception:
-                    logger.exception(
-                        "Tool '%s' failed during execution", tool_call.name
-                    )
-                    raise
+        try:
+            arguments = tool_call.parsed_arguments
+            if tool.arguments_model is not None:
+                arguments = tool.arguments_model.model_validate(arguments)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            return f"Invalid arguments for tool '{tool_call.name}': {exc}", True
 
-                if conversation.ended:
-                    return ""
-                if tool.returns_to_llm:
-                    results[tool_call.id] = result
-                    fed_back_calls.append(tool_call)
+        try:
+            result = await tool.execute(arguments, conversation)
+        except Exception:
+            logger.exception("Tool '%s' failed during execution", tool_call.name)
+            raise
 
-            if not fed_back_calls:
-                return ""  # all tools were fire-and-forget: end the turn
+        if tool.returns_to_llm:
+            return result, True
+        return "", False
 
-            messages.append(self._assistant_tool_call_message(fed_back_calls))
-            for tool_call in fed_back_calls:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": results[tool_call.id],
-                    }
-                )
-        return ""
+    @staticmethod
+    def _append_tool_results(
+        messages: list[dict], fed_back_calls: list[ToolCall], results: dict[str, str]
+    ) -> None:
+        for tool_call in fed_back_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": results[tool_call.id],
+                }
+            )
 
     @staticmethod
     def _assistant_tool_call_message(tool_calls: list[ToolCall]) -> dict:
