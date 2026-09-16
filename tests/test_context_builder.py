@@ -34,6 +34,7 @@ def test_get_context():
         "speaker_bio": "a wizard",
         "speaker_type": "npc",
         "speaker_line_generator": "",
+        "speaker_tools": [],
         "listener_name": "Frodo",
         "listener_gender": "male",
         "listener_age": 50,
@@ -41,6 +42,7 @@ def test_get_context():
         "listener_bio": "a hobbit from the Shire",
         "listener_type": "player",
         "listener_line_generator": "",
+        "listener_tools": [],
         "location": "The Shire",
     }
     assert result == expected_result
