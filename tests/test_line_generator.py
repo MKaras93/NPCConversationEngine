@@ -8,22 +8,30 @@ from npc_conversation_engine.line_generator import (
     HumanLineGenerator,
     LLMLineGenerator,
 )
-from npc_conversation_engine.llm_client import BaseLLMClient, LLMResponse
+from npc_conversation_engine.llm_client import BaseLLMClient, LLMResponse, ToolCall
 from npc_conversation_engine.models.character import Character
 from npc_conversation_engine.models.conversation import Conversation, ConversationMsg
 from npc_conversation_engine.models.location import Location
 from npc_conversation_engine.prompt_manager import PromptManager
 from npc_conversation_engine.storage import Storage
+from npc_conversation_engine.tools import BaseTool
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "prompts")
 
 
 class FakeLLMClient(BaseLLMClient):
-    def __init__(self, response: str = "Hello there!"):
-        self._response = response
+    """A fake LLM client that returns pre-configured responses in sequence."""
+
+    def __init__(self, responses: list[LLMResponse] | None = None):
+        self._responses = list(responses or [LLMResponse(content="Hello there!")])
+        self._call_count = 0
         self.last_messages: list[dict] | None = None
         self.last_model: str | None = None
         self.last_temperature: float | None = None
+        self.last_tools: list[dict] | None = None
+        # History of all calls for assertions
+        self.all_messages: list[list[dict]] = []
+        self.all_tools: list[list[dict] | None] = []
 
     async def chat(
         self,
@@ -32,10 +40,19 @@ class FakeLLMClient(BaseLLMClient):
         temperature: float,
         tools: list[dict] | None = None,
     ) -> LLMResponse:
+        idx = min(self._call_count, len(self._responses) - 1)
         self.last_messages = messages
         self.last_model = model
         self.last_temperature = temperature
-        return LLMResponse(content=self._response)
+        self.last_tools = tools
+        self.all_messages.append(messages)
+        self.all_tools.append(tools)
+        self._call_count += 1
+        return self._responses[idx]
+
+    @property
+    def call_count(self) -> int:
+        return self._call_count
 
 
 @pytest.fixture
@@ -85,7 +102,7 @@ def context_builder():
 
 @pytest.fixture
 def llm_client():
-    return FakeLLMClient(response="A wizard is never late.")
+    return FakeLLMClient(responses=[LLMResponse(content="A wizard is never late.")])
 
 
 @pytest.fixture
@@ -264,3 +281,250 @@ class TestCharacterLineGeneratorField:
         loaded = storage.load("gandalf", Character)
         assert loaded.line_generator == "LLMLineGenerator"
         assert loaded == gandalf
+
+
+# --- Tool-loop tests ---
+
+
+class _GreetTool(BaseTool):
+    """A simple tool that returns a greeting. Used for testing the tool loop."""
+
+    name = "greet"
+    description = "Greet someone."
+    returns_to_llm = True
+
+    async def execute(self, arguments, conversation):
+        return f"Hello, {arguments.get('name', 'stranger')}!"
+
+
+class _FireAndForgetTool(BaseTool):
+    """A tool with returns_to_llm=False for fire-and-forget testing."""
+
+    name = "ping"
+    description = "Send a ping."
+    returns_to_llm = False
+
+    async def execute(self, arguments, conversation):
+        return "pong"
+
+
+class _ExplodingTool(BaseTool):
+    """A tool whose execute() raises an error."""
+
+    name = "explode"
+    description = "Explode."
+    returns_to_llm = True
+
+    async def execute(self, arguments, conversation):
+        raise RuntimeError("boom")
+
+
+class _EndConvTool(BaseTool):
+    """A tool that ends the conversation."""
+
+    name = "end_conversation"
+    description = "End the current conversation."
+    returns_to_llm = False
+
+    async def execute(self, arguments, conversation):
+        conversation.end()
+        return "ended"
+
+
+class _ValidatedTool(BaseTool):
+    """A tool that uses arguments_model for validation."""
+
+    from pydantic import BaseModel as _BaseModel
+
+    class _Args(_BaseModel):
+        name: str
+
+    name = "validated_greet"
+    description = "Greet with validated args."
+    arguments_model = _Args
+    returns_to_llm = True
+
+    async def execute(self, arguments, conversation):
+        return f"Validated hello, {arguments.name}!"
+
+
+class TestToolLoop:
+    @pytest.mark.asyncio
+    async def test_no_tools_sends_tools_none(
+        self, context_builder, prompt_manager, conversation
+    ):
+        """Generator with no tools passes tools=None to the client."""
+        client = FakeLLMClient(responses=[LLMResponse(content="Hi")])
+        gen = LLMLineGenerator(
+            context_builder=context_builder,
+            prompt_manager=prompt_manager,
+            llm_client=client,
+            prompt_path="test_dialogue",
+        )
+        await gen.generate(conversation)
+        assert client.all_tools[0] is None
+
+    @pytest.mark.asyncio
+    async def test_tools_advertised(
+        self, context_builder, prompt_manager, conversation
+    ):
+        """Generator tools are all advertised: the client call receives tools=[spec, ...]."""
+        tool = _GreetTool()
+        client = FakeLLMClient(responses=[LLMResponse(content="Hi")])
+        gen = LLMLineGenerator(
+            context_builder=context_builder,
+            prompt_manager=prompt_manager,
+            llm_client=client,
+            prompt_path="test_dialogue",
+            tools=[tool],
+        )
+        await gen.generate(conversation)
+        assert client.all_tools[0] is not None
+        assert len(client.all_tools[0]) == 1
+        assert client.all_tools[0][0]["function"]["name"] == "greet"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_loop(self, context_builder, prompt_manager, conversation):
+        """A tool call is executed and the result is fed back to the LLM."""
+        tool = _GreetTool()
+        tool_call = ToolCall(id="tc1", name="greet", arguments='{"name": "Frodo"}')
+        client = FakeLLMClient(
+            responses=[
+                LLMResponse(content=None, tool_calls=[tool_call]),
+                LLMResponse(content="The wizard greets you."),
+            ]
+        )
+        gen = LLMLineGenerator(
+            context_builder=context_builder,
+            prompt_manager=prompt_manager,
+            llm_client=client,
+            prompt_path="test_dialogue",
+            tools=[tool],
+        )
+        result = await gen.generate(conversation)
+
+        assert result == "The wizard greets you."
+        assert client.call_count == 2
+        # Second call messages should include the assistant tool_calls message
+        second_call_messages = client.all_messages[1]
+        assistant_tc_msg = next(
+            m
+            for m in second_call_messages
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        assert assistant_tc_msg["tool_calls"][0]["id"] == "tc1"
+        # And a tool result message
+        tool_result_msg = next(
+            m for m in second_call_messages if m.get("role") == "tool"
+        )
+        assert tool_result_msg["tool_call_id"] == "tc1"
+        assert "Hello, Frodo!" in tool_result_msg["content"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_arguments_fed_back(
+        self, context_builder, prompt_manager, conversation
+    ):
+        """Invalid arguments from the LLM are fed back as a sanitized error message."""
+        tool = _ValidatedTool()
+        tool_call = ToolCall(
+            id="tc1", name="validated_greet", arguments='{"wrong": 123}'
+        )
+        client = FakeLLMClient(
+            responses=[
+                LLMResponse(content=None, tool_calls=[tool_call]),
+                LLMResponse(content="Let me try again."),
+            ]
+        )
+        gen = LLMLineGenerator(
+            context_builder=context_builder,
+            prompt_manager=prompt_manager,
+            llm_client=client,
+            prompt_path="test_dialogue",
+            tools=[tool],
+        )
+        result = await gen.generate(conversation)
+
+        # Should not raise; should return the second LLM response
+        assert result == "Let me try again."
+        # execute should never have been called (validated_greet would fail
+        # if execute ran with invalid args)
+        # The second call should contain a tool message with the error
+        second_call_messages = client.all_messages[1]
+        tool_msg = next(m for m in second_call_messages if m.get("role") == "tool")
+        assert tool_msg["content"].startswith("Invalid arguments for tool")
+
+    @pytest.mark.asyncio
+    async def test_execution_error_crashes_loudly(
+        self, context_builder, prompt_manager, conversation
+    ):
+        """A tool whose execute raises re-raises the exception."""
+        tool = _ExplodingTool()
+        tool_call = ToolCall(id="tc1", name="explode", arguments="{}")
+        client = FakeLLMClient(
+            responses=[
+                LLMResponse(content=None, tool_calls=[tool_call]),
+                LLMResponse(content="Should not reach here."),
+            ]
+        )
+        gen = LLMLineGenerator(
+            context_builder=context_builder,
+            prompt_manager=prompt_manager,
+            llm_client=client,
+            prompt_path="test_dialogue",
+            tools=[tool],
+        )
+        with pytest.raises(RuntimeError, match="boom"):
+            await gen.generate(conversation)
+        # Only the first LLM call should have been made
+        assert client.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_fire_and_forget_tool_ends_turn(
+        self, context_builder, prompt_manager, conversation
+    ):
+        """A tool with returns_to_llm=False ends the turn immediately."""
+        tool = _FireAndForgetTool()
+        tool_call = ToolCall(id="tc1", name="ping", arguments="{}")
+        client = FakeLLMClient(
+            responses=[
+                LLMResponse(content=None, tool_calls=[tool_call]),
+                LLMResponse(content="Should not reach here."),
+            ]
+        )
+        gen = LLMLineGenerator(
+            context_builder=context_builder,
+            prompt_manager=prompt_manager,
+            llm_client=client,
+            prompt_path="test_dialogue",
+            tools=[tool],
+        )
+        result = await gen.generate(conversation)
+
+        assert result == ""
+        assert client.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_end_conversation_stops_loop(
+        self, context_builder, prompt_manager, conversation
+    ):
+        """EndConversationTool sets conversation.ended; generate returns '' without further LLM call."""
+        tool = _EndConvTool()
+        tool_call = ToolCall(id="tc1", name="end_conversation", arguments="{}")
+        client = FakeLLMClient(
+            responses=[
+                LLMResponse(content=None, tool_calls=[tool_call]),
+                LLMResponse(content="Should not reach here."),
+            ]
+        )
+        gen = LLMLineGenerator(
+            context_builder=context_builder,
+            prompt_manager=prompt_manager,
+            llm_client=client,
+            prompt_path="test_dialogue",
+            tools=[tool],
+        )
+        result = await gen.generate(conversation)
+
+        assert result == ""
+        assert conversation.ended is True
+        assert client.call_count == 1

@@ -16,6 +16,10 @@ class Conversation:
         self.listener = listener
         self.location = location
         self.history: list[ConversationMsg] = []
+        self.ended: bool = False
+
+    def end(self) -> None:
+        self.ended = True
 
     def to_text(self) -> str:
         lines = [f"{msg.speaker}: {msg.content}" for msg in self.history]

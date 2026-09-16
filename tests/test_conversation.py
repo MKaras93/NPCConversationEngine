@@ -109,3 +109,14 @@ def test_to_text(gandalf, frodo, location, history, expected):
     conversation.history = history
 
     assert conversation.to_text() == expected
+
+
+def test_conversation_starts_not_ended(gandalf, frodo, location):
+    conversation = Conversation(speaker=gandalf, listener=frodo, location=location)
+    assert conversation.ended is False
+
+
+def test_conversation_end_sets_ended(gandalf, frodo, location):
+    conversation = Conversation(speaker=gandalf, listener=frodo, location=location)
+    conversation.end()
+    assert conversation.ended is True
