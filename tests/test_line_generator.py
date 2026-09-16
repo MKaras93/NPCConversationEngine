@@ -8,7 +8,7 @@ from npc_conversation_engine.line_generator import (
     HumanLineGenerator,
     LLMLineGenerator,
 )
-from npc_conversation_engine.llm_client import BaseLLMClient
+from npc_conversation_engine.llm_client import BaseLLMClient, LLMResponse
 from npc_conversation_engine.models.character import Character
 from npc_conversation_engine.models.conversation import Conversation, ConversationMsg
 from npc_conversation_engine.models.location import Location
@@ -25,11 +25,17 @@ class FakeLLMClient(BaseLLMClient):
         self.last_model: str | None = None
         self.last_temperature: float | None = None
 
-    async def chat(self, messages: list[dict], model: str, temperature: float) -> str:
+    async def chat(
+        self,
+        messages: list[dict],
+        model: str,
+        temperature: float,
+        tools: list[dict] | None = None,
+    ) -> LLMResponse:
         self.last_messages = messages
         self.last_model = model
         self.last_temperature = temperature
-        return self._response
+        return LLMResponse(content=self._response)
 
 
 @pytest.fixture

@@ -8,3 +8,4 @@ DEFAULT_MODEL: str = "openrouter/free"
 DEFAULT_TEMPERATURE: float = 0.7
 DEFAULT_MAX_HISTORY: int | None = None
 DEFAULT_TIMEOUT: float = 60.0
+MAX_TOOL_ITERATIONS: int = 5

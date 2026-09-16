@@ -67,7 +67,8 @@ class LLMLineGenerator(BaseLineGenerator):
         messages: list[dict[str, str]] = [{"role": "system", "content": system_msg}]
         messages.extend(history_messages)
 
-        return await self._llm_client.chat(messages, self._model, self._temperature)
+        response = await self._llm_client.chat(messages, self._model, self._temperature)
+        return response.content or ""
 
 
 class HumanLineGenerator(BaseLineGenerator):

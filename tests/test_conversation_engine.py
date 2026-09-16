@@ -4,7 +4,7 @@ import pytest
 
 from npc_conversation_engine.context_builder import ExampleContextBuilder
 from npc_conversation_engine.conversation_engine import ConversationEngine
-from npc_conversation_engine.llm_client import BaseLLMClient
+from npc_conversation_engine.llm_client import BaseLLMClient, LLMResponse
 from npc_conversation_engine.models.character import Character
 from npc_conversation_engine.models.location import Location
 from npc_conversation_engine.prompt_manager import PromptManager
@@ -17,10 +17,16 @@ class FakeLLMClient(BaseLLMClient):
         self._responses = responses or ["Hello there!"]
         self._call_count = 0
 
-    async def chat(self, messages: list[dict], model: str, temperature: float) -> str:
+    async def chat(
+        self,
+        messages: list[dict],
+        model: str,
+        temperature: float,
+        tools: list[dict] | None = None,
+    ) -> LLMResponse:
         response = self._responses[self._call_count % len(self._responses)]
         self._call_count += 1
-        return response
+        return LLMResponse(content=response)
 
 
 @pytest.fixture
