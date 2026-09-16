@@ -1,0 +1,48 @@
+name: Python CI
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Run tests with Pytest
+        run: uv run pytest
+      - name: Run ruff check
+        run: uv run ruff check .
+      - name: Run ruff format
+        run: uv run ruff format --check .
+
+  build-test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Build package
+        run: uv build
+      - name: Verify package metadata
+        run: uv run twine check dist/*
+      - name: Test install and import
+        run: |
+          uv venv .test-venv
+          uv pip install dist/*.whl --python .test-venv/bin/python
+          .test-venv/bin/python -c "from npc_conversation_engine.models import Character; print('Import OK')"
+      - name: Test wheel as external dependency
+        run: uv run --with dist/*.whl scripts/test_as_dependency.py
+      - name: Test sdist as external dependency
+        run: uv run --with dist/*.tar.gz scripts/test_as_dependency.py
