@@ -15,3 +15,4 @@ class Character(BaseModel):
     bio: str
     type: str
     line_generator: str = ""
+    tools: list[str] = []

@@ -72,5 +72,7 @@ async def test_llm_generator_returns_response(conversation):
 
     response = await generator.generate(conversation)
 
+    print(f"\n--- LLMLineGenerator response ---\n  {response!r}")
+
     assert isinstance(response, str)
     assert len(response) > 0

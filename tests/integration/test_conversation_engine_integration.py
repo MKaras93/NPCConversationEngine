@@ -77,18 +77,25 @@ async def test_run_conversation_with_event(engine):
     engine.initialize_conversation(location, speaker, listener)
 
     first_lines = await engine.run_conversation(rounds=2)
+    print("\n--- First 2 lines ---")
+    for i, line in enumerate(first_lines):
+        print(f"  [{i}] {line!r}")
     assert len(first_lines) == 2
     assert all(isinstance(line, str) and len(line) > 0 for line in first_lines)
 
     engine.add_event("The ground shakes.")
 
     second_lines = await engine.run_conversation(rounds=3)
+    print("\n--- Next 3 lines ---")
+    for i, line in enumerate(second_lines):
+        print(f"  [{i}] {line!r}")
     assert len(second_lines) == 3
     assert all(isinstance(line, str) and len(line) > 0 for line in second_lines)
+
+    print("\n--- Full history ---")
+    for i, msg in enumerate(engine.conversation.history):
+        print(f"  [{i}] {msg.speaker}: {msg.content!r}")
 
     assert len(engine.conversation.history) == 6
     assert engine.conversation.history[2].speaker == "<event>"
     assert engine.conversation.history[2].content == "The ground shakes."
-
-    logger.info("\n--- Full Conversation ---")
-    logger.info(engine.conversation.to_text())

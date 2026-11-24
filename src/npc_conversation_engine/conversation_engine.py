@@ -12,6 +12,7 @@ from npc_conversation_engine.models.character import Character
 from npc_conversation_engine.models.conversation import Conversation, ConversationMsg
 from npc_conversation_engine.models.location import Location
 from npc_conversation_engine.prompt_manager import PromptManager
+from npc_conversation_engine.tools import BaseTool, EndConversationTool
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +33,20 @@ class ConversationEngine:
         model: str | None = None,
         temperature: float | None = None,
         max_history: int | None = None,
+        tools: list[BaseTool] | None = None,
     ):
         self.prompt_manager = prompt_manager
         self.template_path = template_path
         self.context_builder = context_builder
         self.llm_client = llm_client
         self.conversation: Conversation | None = None
-        self._generator_cache: dict[str, BaseLineGenerator] = {}
+        self._generator_cache: dict[tuple, BaseLineGenerator] = {}
         self._model = model
         self._temperature = temperature
         self._max_history = max_history
+        self._tools: dict[str, BaseTool] = {"end_conversation": EndConversationTool()}
+        for tool in tools or []:
+            self._tools[tool.name] = tool
 
     def initialize_conversation(
         self, location: Location, speaker: Character, listener: Character
@@ -127,19 +132,22 @@ class ConversationEngine:
         Does NOT switch roles — call switch_roles() separately if needed.
 
         Returns:
-            The generated line of dialogue.
+            The generated line of dialogue, or "" if the conversation ended.
 
         Raises:
             RuntimeError: If no conversation has been initialized.
             ValueError: If the speaker's line_generator type is unknown.
         """
         self._require_conversation()
+        if self.conversation.ended:
+            return ""
         speaker = self.conversation.speaker
         generator = self._get_generator(speaker)
         line = await generator.generate(self.conversation)
-        self.conversation.history.append(
-            ConversationMsg(speaker=speaker.name, content=line)
-        )
+        if line:
+            self.conversation.history.append(
+                ConversationMsg(speaker=speaker.name, content=line)
+            )
         logger.info("%s: %s", speaker.name, line)
         return line
 
@@ -160,21 +168,63 @@ class ConversationEngine:
         self._require_conversation()
         lines: list[str] = []
         for _ in range(rounds):
+            if self.conversation.ended:
+                break
             line = await self.speak_next()
             lines.append(line)
             self.switch_roles()
         return lines
+
+    async def use_tool(self, tool_name: str, arguments: dict | None = None) -> str:
+        """Execute a registered tool programmatically.
+
+        Allows the host app to invoke a tool outside of the LLM loop.
+
+        Args:
+            tool_name: The name of the tool to execute.
+            arguments: Optional arguments dict for the tool.
+
+        Returns:
+            The tool's result string.
+
+        Raises:
+            RuntimeError: If no conversation has been initialized.
+            ValueError: If the tool name is not registered.
+        """
+        self._require_conversation()
+        tool = self._tools.get(tool_name)
+        if tool is None:
+            raise ValueError(
+                f"Unknown tool '{tool_name}'. Available: {sorted(self._tools)}"
+            )
+        return await tool.execute(arguments or {}, self.conversation)
 
     def _get_generator(self, character: Character) -> BaseLineGenerator:
         """Get or create a cached line generator for a character."""
         gen_type = character.line_generator
         if not gen_type:
             raise ValueError(f"Character '{character.name}' has no line_generator set.")
-        if gen_type not in self._generator_cache:
-            self._generator_cache[gen_type] = self._create_generator(gen_type)
-        return self._generator_cache[gen_type]
+        tool_names = tuple(character.tools)
+        cache_key = (gen_type, tool_names)
+        if cache_key not in self._generator_cache:
+            tools = self._resolve_tools(tool_names)
+            self._generator_cache[cache_key] = self._create_generator(gen_type, tools)
+        return self._generator_cache[cache_key]
 
-    def _create_generator(self, gen_type: str) -> BaseLineGenerator:
+    def _resolve_tools(self, tool_names: tuple[str, ...]) -> list[BaseTool]:
+        """Resolve tool names to BaseTool instances."""
+        tools = []
+        for name in tool_names:
+            if name not in self._tools:
+                raise ValueError(
+                    f"Unknown tool '{name}'. Available: {sorted(self._tools)}"
+                )
+            tools.append(self._tools[name])
+        return tools
+
+    def _create_generator(
+        self, gen_type: str, tools: list[BaseTool] | None = None
+    ) -> BaseLineGenerator:
         """Instantiate a line generator by type name."""
         if gen_type == "HumanLineGenerator":
             return HumanLineGenerator()
@@ -196,6 +246,8 @@ class ConversationEngine:
             kwargs["temperature"] = self._temperature
         if self._max_history is not None:
             kwargs["max_history"] = self._max_history
+        if tools:
+            kwargs["tools"] = tools
         return LLMLineGenerator(**kwargs)
 
     def _require_conversation(self) -> None:
